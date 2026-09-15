@@ -38,6 +38,11 @@ app.use((req, res, next) => {
 // served from Hostinger — kept in case you want to test locally.
 app.use(express.static(path.join(__dirname, 'public')));
 
+// Health check endpoint for Railway
+app.get('/ping', (req, res) => {
+  res.status(200).send('ok');
+});
+
 const PORT = process.env.PORT || 3000;
 
 // Secret Linkvertise Anti-Bypass token — NEVER sent to the browser.
