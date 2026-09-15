@@ -1,219 +1,148 @@
-// ============================================================
-//  KEY SERVER — deploy on Railway (railway.app)
-//
-//  FIX: Keys are now persisted to a JSON file on disk so they
-//  survive Railway restarts and redeploys.
-//
-//  REQUIRED: Add a Railway Volume mounted at /data
-//  (Railway Dashboard → your service → Volumes → Add Volume → mount path: /data)
-//
-//  ENVIRONMENT VARIABLES:
-//    API_SECRET = ks_fire99  (must match destination.html and KeySystem.lua)
-//    PORT       = set automatically by Railway — do NOT set manually
-// ============================================================
+/**
+ * server.js — Checkpoint 2 verification backend
+ *
+ * This is the only place that decides whether a checkpoint was really
+ * completed. The HTML page never makes that decision itself — it just
+ * asks this server and shows/hides content based on the answer.
+ *
+ * Run:
+ *   npm install
+ *   cp .env.example .env      # fill in your real values
+ *   node server.js
+ */
 
-const http = require("http");
-const fs   = require("fs");
-const path = require("path");
+const express = require('express');
+const path = require('path');
 
-const PORT    = process.env.PORT || 3000;
-const SECRET  = process.env.API_SECRET || "changeme";
+const app = express();
+app.use(express.json());
 
-// ── Persistent storage path ──────────────────────────────────
-// Railway Volume must be mounted at /data
-// Falls back to local file if no volume (keys won't survive restarts without the volume)
-const DATA_DIR  = fs.existsSync("/data") ? "/data" : __dirname;
-const KEYS_FILE = path.join(DATA_DIR, "keys.json");
-
-// ── Load keys from disk on startup ───────────────────────────
-let keys = new Map();
-
-function loadKeys() {
-  try {
-    if (fs.existsSync(KEYS_FILE)) {
-      const raw = fs.readFileSync(KEYS_FILE, "utf8");
-      const obj = JSON.parse(raw);
-      keys = new Map(Object.entries(obj));
-      console.log(`[KeyServer] Loaded ${keys.size} keys from disk`);
-    }
-  } catch (e) {
-    console.error("[KeyServer] Failed to load keys from disk:", e.message);
-    keys = new Map();
+// checkpoint2.html now lives on Hostinger, not here — so this is a
+// cross-origin call. Allow only your real domain(s), not "*".
+const ALLOWED_ORIGINS = [
+  'https://synthhub.net',
+  'https://www.synthhub.net'
+];
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (ALLOWED_ORIGINS.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   }
-}
-
-function saveKeys() {
-  try {
-    const obj = Object.fromEntries(keys);
-    fs.writeFileSync(KEYS_FILE, JSON.stringify(obj, null, 2), "utf8");
-  } catch (e) {
-    console.error("[KeyServer] Failed to save keys to disk:", e.message);
-  }
-}
-
-loadKeys();
-
-// ── Auto-clean expired keys every 30s ────────────────────────
-setInterval(() => {
-  const now = Date.now();
-  let removed = 0;
-  for (const [k, v] of keys) {
-    if (now > v.expires_at) {
-      keys.delete(k);
-      removed++;
-    }
-  }
-  if (removed > 0) {
-    saveKeys();
-    console.log(`[cleanup] removed ${removed} expired key(s)`);
-  }
-}, 30000);
-
-// ── Helpers ───────────────────────────────────────────────────
-function send(res, status, data) {
-  const body = JSON.stringify(data);
-  res.writeHead(status, {
-    "Content-Type":                 "application/json",
-    "Access-Control-Allow-Origin":  "*",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type",
-  });
-  res.end(body);
-}
-
-function readBody(req) {
-  return new Promise((resolve, reject) => {
-    let raw = "";
-    req.on("data", chunk => (raw += chunk));
-    req.on("end", () => {
-      try { resolve(JSON.parse(raw)); }
-      catch { reject(new Error("bad json")); }
-    });
-    req.on("error", reject);
-  });
-}
-
-// ── Server ────────────────────────────────────────────────────
-const server = http.createServer(async (req, res) => {
-  // CORS preflight
-  if (req.method === "OPTIONS") {
-    res.writeHead(204, {
-      "Access-Control-Allow-Origin":  "*",
-      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type",
-    });
-    return res.end();
-  }
-
-  const url = req.url.split("?")[0];
-
-  // ── GET /ping ─────────────────────────────────────────────
-  if (url === "/ping" && req.method === "GET") {
-    return send(res, 200, { ok: true, ts: Date.now(), keys: keys.size });
-  }
-
-  // ── POST /register ────────────────────────────────────────
-  // Called by destination.html when a key is generated
-  // Body: { key, expires_at, secret, token }
-  if (url === "/register" && req.method === "POST") {
-    let body;
-    try { body = await readBody(req); }
-    catch { return send(res, 400, { error: "bad json" }); }
-
-    if (body.secret !== SECRET) return send(res, 401, { error: "unauthorized" });
-
-    const hash = body.token;
-
-    if (hash === "admin_bypass") {
-      console.log("[register] admin bypass — skipping work.ink check");
-    } else {
-      if (!hash || hash === "{TOKEN}" || hash.trim() === "") {
-        console.log("[register] blocked — no work.ink token");
-        return send(res, 403, { error: "no_token", message: "Complete the work.ink checkpoint first." });
-      }
-
-      try {
-        const checkRes = await fetch(
-          `https://work.ink/_api/v2/token/isValid/${encodeURIComponent(hash)}?deleteToken=1`
-        );
-        const checkData = await checkRes.json();
-        if (!checkData.valid) {
-          console.log(`[register] blocked — invalid/used token: ${hash}`);
-          return send(res, 403, { error: "invalid_token", message: "Invalid or already used work.ink token." });
-        }
-        console.log(`[register] work.ink token valid: ${hash}`);
-      } catch (e) {
-        console.error("[register] work.ink API error:", e.message);
-        return send(res, 503, { error: "verification_unavailable" });
-      }
-    }
-
-    const expiresAt = new Date(body.expires_at).getTime();
-    if (isNaN(expiresAt)) return send(res, 400, { error: "invalid expires_at" });
-
-    keys.set(body.key, {
-      key:        body.key,
-      expires_at: expiresAt,
-      hwid:       null,
-      created_at: Date.now(),
-    });
-
-    // ✅ Persist to disk so the key survives restarts
-    saveKeys();
-
-    console.log(`[register] key=${body.key} expires=${body.expires_at}`);
-    return send(res, 200, { ok: true });
-  }
-
-  // ── POST /validate ────────────────────────────────────────
-  // Called by the Lua script
-  // Body: { key, hwid }
-  if (url === "/validate" && req.method === "POST") {
-    let body;
-    try { body = await readBody(req); }
-    catch { return send(res, 400, { error: "bad json" }); }
-
-    const { key, hwid } = body;
-    if (!key || !hwid) return send(res, 400, { valid: false, reason: "missing_fields" });
-
-    const record = keys.get(key);
-
-    if (!record) {
-      console.log(`[validate] not_found key=${key}`);
-      return send(res, 200, { valid: false, reason: "not_found" });
-    }
-
-    // Expired? (lifetime keys have expires_at = year 9999, skip check)
-    const isLifetime = record.expires_at > 253370764800000;
-    if (!isLifetime && Date.now() > record.expires_at) {
-      keys.delete(key);
-      saveKeys();
-      console.log(`[validate] expired key=${key}`);
-      return send(res, 200, { valid: false, reason: "expired" });
-    }
-
-    // First use — bind HWID
-    if (!record.hwid) {
-      record.hwid = hwid;
-      saveKeys();
-      console.log(`[validate] bound key=${key} hwid=${hwid}`);
-      return send(res, 200, { valid: true, reason: "bound" });
-    }
-
-    // Wrong device
-    if (record.hwid !== hwid) {
-      console.log(`[validate] wrong_hwid key=${key}`);
-      return send(res, 200, { valid: false, reason: "wrong_hwid" });
-    }
-
-    console.log(`[validate] ok key=${key}`);
-    return send(res, 200, { valid: true, reason: "ok" });
-  }
-
-  return send(res, 404, { error: "not found" });
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
 });
 
-server.listen(PORT, () => {
-  console.log(`[KeyServer] Running on port ${PORT}`);
-  console.log(`[KeyServer] Storing keys at: ${KEYS_FILE}`);
+// The /public folder here is optional now that checkpoint2.html is
+// served from Hostinger — kept in case you want to test locally.
+app.use(express.static(path.join(__dirname, 'public')));
+
+const PORT = process.env.PORT || 3000;
+
+// Secret Linkvertise Anti-Bypass token — NEVER sent to the browser.
+const LINKVERTISE_TOKEN = process.env.LINKVERTISE_ANTI_BYPASS_TOKEN || '';
+
+// The real reward, only handed out after verification succeeds.
+// Put your actual key/content behind this env var.
+const ACCESS_KEY = process.env.ACCESS_KEY || 'REPLACE_ME_IN_ENV';
+
+// In-memory replay guard: a hash/token that's already been redeemed
+// can't be redeemed again. Fine for a single instance; swap for
+// Redis/a DB if you ever run more than one server process.
+const usedTokens = new Set();
+
+// Very small per-IP rate limit so this endpoint can't be hammered.
+const hits = new Map(); // ip -> [timestamps]
+const RATE_WINDOW_MS = 10_000;
+const RATE_MAX = 8;
+function rateLimited(ip) {
+  const now = Date.now();
+  const arr = (hits.get(ip) || []).filter(t => now - t < RATE_WINDOW_MS);
+  arr.push(now);
+  hits.set(ip, arr);
+  return arr.length > RATE_MAX;
+}
+
+async function verifyLinkvertise(hash) {
+  if (!LINKVERTISE_TOKEN) {
+    console.error('[verify] LINKVERTISE_ANTI_BYPASS_TOKEN is not set');
+    return false;
+  }
+  const url = `https://publisher.linkvertise.com/api/v1/anti_bypassing?token=${encodeURIComponent(LINKVERTISE_TOKEN)}&hash=${encodeURIComponent(hash)}`;
+  try {
+    const res = await fetch(url, { method: 'POST' });
+    const raw = (await res.text()).trim();
+    console.log('[verify:linkvertise] status', res.status, 'body:', raw);
+    // Docs describe a bare boolean-style response. Handle both a plain
+    // "true" string and a {"result":true}-style JSON body defensively.
+    if (raw.toLowerCase() === 'true') return true;
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed === true) return true;
+      if (parsed && (parsed.result === true || parsed.valid === true)) return true;
+    } catch (_) { /* not JSON, already handled above */ }
+    return false;
+  } catch (err) {
+    console.error('[verify:linkvertise] request failed', err);
+    return false;
+  }
+}
+
+async function verifyWorkink(hash) {
+  const url = `https://work.ink/_api/v2/token/isValid/${encodeURIComponent(hash)}?deleteToken=1`;
+  try {
+    const res = await fetch(url);
+    const data = await res.json();
+    console.log('[verify:workink] status', res.status, 'body:', data);
+    return data && data.valid === true;
+  } catch (err) {
+    console.error('[verify:workink] request failed', err);
+    return false;
+  }
+}
+
+async function verifyLootlabs(_hash) {
+  // Deliberately fails closed. LootLabs' documented anti-bypass mechanism
+  // is the Redirect API (pre-encrypt the destination URL server-side via
+  // POST creators.lootlabs.gg/api/public/url_encryptor and pass it as
+  // &data= on the LootLabs link) — not a post-redirect hash you validate
+  // here. Confirm the real mechanism with LootLabs support/dashboard
+  // before wiring this path up; shipping a guess would mean silently
+  // trusting unverified traffic.
+  console.warn('[verify:lootlabs] not implemented — failing closed');
+  return false;
+}
+
+app.post('/api/verify', async (req, res) => {
+  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
+  if (rateLimited(ip)) {
+    return res.status(429).json({ ok: false, error: 'rate_limited' });
+  }
+
+  const { provider, token } = req.body || {};
+  if (!provider || !token || typeof token !== 'string') {
+    return res.status(400).json({ ok: false, error: 'missing_fields' });
+  }
+
+  if (usedTokens.has(token)) {
+    return res.status(409).json({ ok: false, error: 'already_used' });
+  }
+
+  let verified = false;
+  if (provider === 'linkvertise') verified = await verifyLinkvertise(token);
+  else if (provider === 'workink') verified = await verifyWorkink(token);
+  else if (provider === 'lootlabs') verified = await verifyLootlabs(token);
+  else return res.status(400).json({ ok: false, error: 'unknown_provider' });
+
+  if (!verified) {
+    return res.status(403).json({ ok: false, error: 'not_verified' });
+  }
+
+  usedTokens.add(token);
+  return res.json({ ok: true, key: ACCESS_KEY });
+});
+
+app.listen(PORT, () => {
+  console.log(`Checkpoint verification server listening on :${PORT}`);
 });
