@@ -7,8 +7,6 @@ const path = require('path');
 
 const app = express();
 app.use(express.json());
-// Allows checkpoint verification without a cross-origin JSON preflight.
-app.use(express.urlencoded({ extended: false, limit: '4kb' }));
 
 const ALLOWED_ORIGINS = [
   'https://synthhub.net',
@@ -17,7 +15,6 @@ const ALLOWED_ORIGINS = [
 app.use((req, res, next) => {
   const origin = req.headers.origin;
   if (ALLOWED_ORIGINS.includes(origin)) {
-    res.vary('Origin');
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -33,7 +30,7 @@ app.get('/ping', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-const LINKVERTISE_TOKEN = (process.env.LINKVERTISE_ANTI_BYPASS_TOKEN || '').trim();
+const LINKVERTISE_TOKEN = process.env.LINKVERTISE_ANTI_BYPASS_TOKEN || '';
 const API_SECRET = process.env.API_SECRET || '';
 
 const usedTokens = new Set();
@@ -51,62 +48,18 @@ function rateLimited(ip) {
 }
 
 async function verifyLinkvertise(hash) {
-  const fail = (status, error, message) => ({ ok: false, status, error, message });
-  if (!LINKVERTISE_TOKEN) {
-    return fail(503, 'linkvertise_not_configured', 'Linkvertise verification is not configured on this server. Please contact the site owner.');
-  }
-  if (LINKVERTISE_TOKEN.length !== 64 || /\s/.test(LINKVERTISE_TOKEN)) {
-    return fail(503, 'linkvertise_config_invalid', 'The server has an incorrectly formatted Linkvertise publisher token. Please contact the site owner.');
-  }
-  if (typeof hash !== 'string' || hash.length !== 64 || /\s/.test(hash)) {
-    return fail(400, 'linkvertise_hash_malformed', 'A valid Linkvertise redirect hash was not received. Complete checkpoint 1 again.');
-  }
-  const url = new URL('https://publisher.linkvertise.com/api/v1/anti_bypassing');
-  url.searchParams.set('token', LINKVERTISE_TOKEN);
-  url.searchParams.set('hash', hash);
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 8000);
+  if (!LINKVERTISE_TOKEN) return false;
+  const url = `https://publisher.linkvertise.com/api/v1/anti_bypassing?token=${encodeURIComponent(LINKVERTISE_TOKEN)}&hash=${encodeURIComponent(hash)}`;
   try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { Accept: 'application/json' },
-      signal: controller.signal,
-      redirect: 'error'
-    });
+    const res = await fetch(url, { method: 'POST' });
     const raw = (await res.text()).trim();
-    // Never log the request URL: it contains the publisher secret and visitor hash.
-    if (/invalid\s+(?:authentication\s+)?token/i.test(raw)) {
-      return fail(503, 'linkvertise_auth_rejected', 'Linkvertise rejected the server publisher token. Please contact the site owner.');
-    }
-    if (!res.ok) {
-      return fail(502, 'linkvertise_upstream_http', 'Linkvertise could not verify this visit right now. Complete the checkpoint again shortly.');
-    }
-    let parsed;
-    try { parsed = JSON.parse(raw); } catch (_) { parsed = raw; }
-    // Accept explicit true only. Strings such as "false" are never truthy proof.
-    const positive = parsed === true ||
-      (typeof parsed === 'string' && parsed.toLowerCase() === 'true') ||
-      (parsed && typeof parsed === 'object' && (parsed.result === true || parsed.valid === true));
-    if (positive) return { ok: true };
-    const negative = parsed === false ||
-      (typeof parsed === 'string' && parsed.toLowerCase() === 'false') ||
-      (parsed && typeof parsed === 'object' && (parsed.result === false || parsed.valid === false));
-    if (negative) {
-      return fail(403, 'linkvertise_hash_rejected', 'Linkvertise did not recognize this hash. It may have expired or already been used. Complete the checkpoint again for a fresh link.');
-    }
-    return fail(502, 'linkvertise_unexpected_response', 'Linkvertise returned an unexpected verification response. Please contact the site owner.');
-  } catch (error) {
-    return fail(502,
-      error.name === 'AbortError' ? 'linkvertise_timeout' : 'linkvertise_unreachable',
-      'The server could not get a verification response from Linkvertise. Complete the checkpoint again shortly.');
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-function sendLinkvertiseFailure(res, result) {
-  console.warn('[Linkvertise]', result.error);
-  return res.status(result.status).json({ ok: false, error: result.error, message: result.message });
+    if (raw.toLowerCase() === 'true') return true;
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed === true || (parsed && (parsed.result === true || parsed.valid === true))) return true;
+    } catch (_) {}
+    return false;
+  } catch { return false; }
 }
 
 async function verifyWorkink(hash) {
@@ -163,23 +116,22 @@ app.post('/register', async (req, res) => {
   if (secret !== API_SECRET) return res.status(401).json({ ok: false, error: 'bad_secret' });
   if (!key || !expires_at || !provider || !token) return res.status(400).json({ ok: false, error: 'missing_fields' });
 
+  // Admin requests are authenticated by API_SECRET above.
+  // Only checkpoint completion tokens are single-use.
+  const isAdmin = provider === 'admin' && token === 'admin_bypass';
   const replayId = `${provider}:${token}`;
-  if (usedTokens.has(replayId)) return res.status(409).json({ ok: false, message: `Invalid or already used ${provider} token.` });
+  if (!isAdmin && usedTokens.has(replayId)) return res.status(409).json({ ok: false, message: `Invalid or already used ${provider} token.` });
 
   let verified = false;
   if (provider === 'workink')     verified = await verifyWorkink(token);
-  else if (provider === 'linkvertise') {
-    const result = await verifyLinkvertise(token);
-    if (!result.ok) return sendLinkvertiseFailure(res, result);
-    verified = true;
-  }
+  else if (provider === 'linkvertise') verified = await verifyLinkvertise(token);
   else if (provider === 'lootlabs')   verified = await verifyLootlabs(token);
-  else if (token === 'admin_bypass')  verified = true; // admin key generator
+  else if (isAdmin)                  verified = true; // admin key generator
   else return res.status(400).json({ ok: false, error: 'unknown_provider' });
 
   if (!verified) return res.status(403).json({ ok: false, message: `Invalid or already used ${provider} token.` });
 
-  usedTokens.add(replayId);
+  if (!isAdmin) usedTokens.add(replayId);
   issuedKeys.set(key, { provider, expiresAt: expires_at, issuedAt: Date.now(), hwid: null });
 
   return res.json({ ok: true, key });
@@ -226,16 +178,10 @@ app.post('/validate', (req, res) => {
 });
 
 app.post('/api/verify', async (req, res) => {
-  res.setHeader('Cache-Control', 'no-store');
-  const { provider } = req.body || {};
-  const token = req.body?.token || req.body?.hash || '';
+  const { provider, token } = req.body || {};
   if (!provider || !token) return res.status(400).json({ ok: false, error: 'missing_fields' });
   let verified = false;
-  if (provider === 'linkvertise') {
-    const result = await verifyLinkvertise(token);
-    if (!result.ok) return sendLinkvertiseFailure(res, result);
-    verified = true;
-  }
+  if (provider === 'linkvertise') verified = await verifyLinkvertise(token);
   else if (provider === 'workink') verified = await verifyWorkink(token);
   else if (provider === 'lootlabs') verified = await verifyLootlabs(token);
   else return res.status(400).json({ ok: false, error: 'unknown_provider' });
@@ -259,11 +205,4 @@ setInterval(() => {
 
 app.listen(PORT, () => {
   console.log('Checkpoint verification server listening on :' + PORT);
-  if (!LINKVERTISE_TOKEN) {
-    console.warn('[Linkvertise] Set LINKVERTISE_ANTI_BYPASS_TOKEN in Railway Variables to your publisher authentication token.');
-  } else if (LINKVERTISE_TOKEN.length !== 64 || /\s/.test(LINKVERTISE_TOKEN)) {
-    console.warn('[Linkvertise] LINKVERTISE_ANTI_BYPASS_TOKEN must be 64 characters, without quotes or whitespace.');
-  } else {
-    console.log('[Linkvertise] Publisher token configured; its validity is checked by Linkvertise when a visitor returns.');
-  }
 });
